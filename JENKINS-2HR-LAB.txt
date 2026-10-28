@@ -1,0 +1,358 @@
+==========================================================================
+             JENKINS IN 2-3 HOURS  --  HANDS-ON LAB WITH BUGS
+==========================================================================
+
+Lab code : Desktop\Projects\jenkins-lab
+Hints    : Desktop\JENKINS-LAB-HINTS.txt  (open ONLY when stuck)
+Where    : your Ubuntu VM (it already has Docker)
+
+TIME PLAN
+  Part 0  Concepts .......................... 10 min
+  Part 1  Start Jenkins ..................... 20 min
+  Part 2  Your first pipeline (no repo) ..... 15 min
+  Part 3  Real pipeline + 8 BUGS ............ 60-75 min   <-- the main part
+  Part 4  Auto-build on git push ............ 10 min
+  Part 5  Monitoring job + 3 INCIDENTS ...... 30 min
+  Part 6  Recap + interview questions ....... 10 min
+
+
+==========================================================================
+PART 0 - CONCEPTS (read once, 10 min)
+==========================================================================
+
+Jenkins = a server that runs your steps (test, build, deploy) for you,
+automatically, every time code changes. It's like a robot that types
+your terminal commands, and shouts when one fails.
+
+  WORD          MEANING
+  ------------  ----------------------------------------------------------
+  Job/Project   One thing Jenkins knows how to do ("build hello-app")
+  Build         One run of a job. Numbered: #1, #2, #3...
+  Pipeline      A job written as code (steps in order)
+  Jenkinsfile   The file in your repo that holds that pipeline code
+  Stage         A named group of steps (Install, Test, Deploy...)
+  Step          One action: sh 'command', echo 'text', junit '...'
+  Agent         The machine that runs the steps. "agent any" = any free one
+  Executor      A "slot" on an agent. 2 executors = 2 builds at once
+  Workspace     The folder where Jenkins clones your repo for a build
+  Console Output  The full log of a build. YOUR #1 DEBUG TOOL
+  Credentials   Secrets stored in Jenkins (passwords, tokens), never in git
+  Plugin        Add-on. Jenkins is small; plugins add Git, Docker, etc.
+  Trigger       What starts a build: a click, a timer (cron), a git change
+
+How a Jenkinsfile looks:
+
+  pipeline {                 <- start of pipeline
+    agent any                <- run on any free agent
+    stages {                 <- list of stages
+      stage('Test') {        <- one stage with a name
+        steps {              <- what to do in it
+          sh 'pytest'        <- run a shell command
+        }
+      }
+    }
+    post {                   <- runs AFTER all stages
+      always  { ... }        <- always
+      failure { ... }        <- only if build failed
+    }
+  }
+
+Rule: if ANY sh command exits with non-zero code, that stage turns RED,
+later stages are SKIPPED, and the build is FAILED. "post" still runs.
+
+Our lab setup (picture it):
+
+   GitHub repo (jenkins-lab)
+        |  Jenkins clones it
+        v
+   +-------------------- Ubuntu VM ------------------------+
+   |  [jenkins container]  --docker.sock-->  Docker engine |
+   |        |  builds image, runs:                         |
+   |        v                                              |
+   |  [hello-app container]  port 8081                     |
+   |   (both on docker network "lab-net")                  |
+   +-------------------------------------------------------+
+
+
+==========================================================================
+PART 1 - START JENKINS (20 min)
+==========================================================================
+
+1. Copy the lab to the VM. In Windows PowerShell:
+
+   scp -r "C:\Users\adith\OneDrive\Desktop\Projects\jenkins-lab" adithya@<VM-IP>:~/Desktop/
+
+   (VM IP: run `hostname -I` on the VM)
+
+2. On the VM, make it a GitHub repo:
+   - On github.com create a new PUBLIC repo named  jenkins-lab  (empty, no README)
+   - Then on the VM:
+
+   cd ~/Desktop/jenkins-lab
+   chmod +x ops/chaos.sh
+   git init -b main
+   git add .
+   git commit -m "Initial lab"
+   git remote add origin git@github.com:adithyashen0y/jenkins-lab.git
+   git push -u origin main
+
+3. Start Jenkins:
+
+   cd ~/Desktop/jenkins-lab/jenkins-server
+   docker compose up -d --build
+
+     up      = start
+     -d      = in background
+     --build = build our custom Jenkins image first (has python + docker CLI)
+
+   First build takes a few minutes. Check it's running:
+
+   docker ps                 -> you should see "jenkins"
+   docker logs -f jenkins    -> watch until "Jenkins is fully up and running"
+                                (Ctrl+C to stop watching)
+
+4. Open in Windows browser:  http://<VM-IP>:8080
+
+5. It asks for an "initial admin password". Get it:
+
+   docker exec jenkins cat /var/jenkins_home/secrets/initialAdminPassword
+
+     docker exec jenkins = run a command inside the jenkins container
+     cat ...             = print the password file
+
+6. Click "Install suggested plugins". Wait.
+7. Create your admin user. Keep URL as is. "Start using Jenkins".
+
+CHECKPOINT: you see the Jenkins dashboard.
+
+Look around (2 min): "Manage Jenkins" -> "Nodes" (the built-in node and
+its executors), "Plugins", "Credentials". You'll come back to all three.
+
+
+==========================================================================
+PART 2 - YOUR FIRST PIPELINE, NO REPO (15 min)
+==========================================================================
+
+1. Dashboard -> "New Item" -> name: hello-pipeline -> "Pipeline" -> OK
+2. Scroll to "Pipeline" section. Definition: "Pipeline script". Paste:
+
+   pipeline {
+     agent any
+     stages {
+       stage('Hello') {
+         steps {
+           echo 'Hello from Jenkins'
+           sh 'whoami && pwd && date'
+         }
+       }
+       stage('Break me') {
+         steps {
+           sh 'exit 1'
+         }
+       }
+       stage('Never runs') {
+         steps { echo 'you will not see this' }
+       }
+     }
+     post {
+       failure { echo 'post/failure ran!' }
+     }
+   }
+
+3. Save -> "Build Now".
+4. Click build #1 -> "Console Output". Read it top to bottom. Notice:
+   - whoami = jenkins (builds run as the jenkins user)
+   - pwd = /var/jenkins_home/workspace/hello-pipeline (the workspace)
+   - "script returned exit code 1" -> this is how failures look
+   - "Never runs" was skipped, but post/failure ran
+
+5. Change 'exit 1' to 'exit 0', save, build again -> green.
+
+LEARNED: stages, steps, sh, exit codes, console output, post.
+
+
+==========================================================================
+PART 3 - THE REAL PIPELINE + 8 BUGS (60-75 min)
+==========================================================================
+
+The story: a colleague wrote the Jenkinsfile in the jenkins-lab repo and
+left for holiday. It has never worked. Your job: make the build GREEN
+and the app reachable at http://<VM-IP>:8081
+
+What the pipeline should do:
+  Info -> Install (venv + pip) -> Test (pytest) -> Build image (docker)
+       -> Deploy (run container) -> Smoke test (curl /health)
+       -> post: publish test report
+
+1. Create the job:
+   New Item -> name: hello-app -> Pipeline -> OK
+   Pipeline section:
+     Definition      : Pipeline script from SCM
+     SCM             : Git
+     Repository URL  : https://github.com/adithyashen0y/jenkins-lab.git
+     Script Path     : Jenkinsfile
+   Leave everything else as is. Save.
+
+2. Build Now. It will fail. Then repeat this loop:
+
+   +--------------------------------------------------------------+
+   |  1. Open Console Output                                      |
+   |  2. Find the FIRST real error (scroll up from the bottom,    |
+   |     look for "ERROR", "exit code", "denied", "not found")    |
+   |  3. Ask: is it the JOB CONFIG, the CODE, the JENKINSFILE,    |
+   |     the JENKINS SERVER, or a MISSING SECRET?                 |
+   |  4. Fix it in the right place                                |
+   |  5. If you changed repo files: git add, commit, push         |
+   |  6. Build Now again                                          |
+   +--------------------------------------------------------------+
+
+   There are 8 problems. Some only show up after you fix the one before.
+   One build can show 2 errors at once - fix both.
+
+   RULES (like a real job):
+   - Never "fix" a test by deleting it or changing what it expects.
+     The test describes the correct behaviour. Fix the code.
+   - Never put the secret value inside the Jenkinsfile or git.
+   - Fix the root cause, not the symptom.
+
+   Write a one-line note for each bug you fix:  symptom -> cause -> fix
+   (this is literally what an incident write-up is)
+
+DEBUG TOOLBOX (use these on the VM):
+
+   docker ps -a                    all containers, incl. stopped ones
+   docker logs jenkins             Jenkins server log
+   docker logs hello-app           the app's log
+   docker exec -it jenkins bash    get a shell INSIDE Jenkins - then you can
+                                   run the same command the pipeline runs,
+                                   as the same user, and see what happens
+   docker network inspect lab-net  who is on the lab network
+   ls /var/jenkins_home/workspace/hello-app    (inside jenkins) the workspace
+
+   In the Jenkins UI:
+   - Build page -> "Console Output"
+   - Build page -> "Test Result" (after junit works)
+   - Job page   -> "Configure" (the job's settings)
+   - Manage Jenkins -> Credentials
+
+YOU'RE DONE WITH PART 3 WHEN:
+   - 2 builds in a row go green (yes, run it twice - that's a hint)
+   - http://<VM-IP>:8081 shows "Hello from build #N"
+   - the build page shows a "Test Result" with 5 passing tests
+
+
+==========================================================================
+PART 4 - AUTO-BUILD ON GIT PUSH (10 min)
+==========================================================================
+
+Real teams don't click "Build Now". Two ways to auto-trigger:
+  Webhook  : GitHub calls Jenkins on every push (needs Jenkins on the
+             internet - our VM isn't, so we can't)
+  Poll SCM : Jenkins asks GitHub "anything new?" on a timer  <- we use this
+
+1. Add this to the Jenkinsfile, right after "agent any":
+
+   triggers {
+       pollSCM('H/2 * * * *')
+   }
+
+   Cron format: minute hour day month weekday
+   H/2 = "every 2 minutes, at a spread-out minute" (H = hash, stops all
+         jobs firing on the exact same second)
+
+2. Push it. Build once manually.
+   GOTCHA: Jenkins only learns about triggers in a Jenkinsfile AFTER it
+   has run that Jenkinsfile once.
+3. Now change the greeting in app/app.py, push, and DON'T click anything.
+   Within ~2 min a build starts by itself. Check http://<VM-IP>:8081.
+   Build page says "Started by an SCM change".
+
+Also add, next to triggers, good-practice options:
+
+   options {
+       buildDiscarder(logRotator(numToKeepStr: '10'))   // keep last 10 builds, saves disk
+       timeout(time: 10, unit: 'MINUTES')              // kill hung builds
+   }
+
+
+==========================================================================
+PART 5 - BE THE ON-CALL ENGINEER: MONITORING + 3 INCIDENTS (30 min)
+==========================================================================
+
+A deploy pipeline isn't monitoring. You need something that checks the
+app all the time and goes RED when it's down.
+
+1. New Item -> name: monitor-hello-app -> Pipeline -> "Pipeline script":
+
+   pipeline {
+     agent any
+     triggers { cron('H/2 * * * *') }
+     options  { buildDiscarder(logRotator(numToKeepStr: '30')) }
+     stages {
+       stage('Health check') {
+         steps {
+           sh 'curl -fsS --max-time 5 http://hello-app:5000/health'
+         }
+       }
+     }
+     post {
+       failure { echo 'ALERT: hello-app is DOWN' }
+     }
+   }
+
+     curl -f          = fail (non-zero exit) on HTTP 4xx/5xx
+     -sS              = quiet, but still print errors
+     --max-time 5     = give up after 5 sec (never hang a monitor)
+     hello-app:5000   = container name + inside port (why not localhost?
+                        you learned this in Part 3)
+
+2. Build Now once (so the cron trigger registers). It should be green.
+   In real life the "echo ALERT" would be a Slack/email/Discord message.
+
+3. INCIDENT DRILLS. On the VM:
+
+   cd ~/Desktop/jenkins-lab
+   ./ops/chaos.sh 1
+
+   Then act like you got paged. Don't read chaos.sh. For each incident:
+     a. Detect  : which job went red? What does its console say?
+     b. Diagnose: use the toolbox (docker ps -a, docker logs, ...)
+     c. Fix     : restore service. Best fix = the "proper" way, not a hack
+     d. Verify  : monitor job green again
+     e. Write   : symptom -> cause -> fix -> how to prevent
+
+   Do the same for:   ./ops/chaos.sh 2      and      ./ops/chaos.sh 3
+
+   Note: each incident looks DIFFERENT in the logs. Learning to tell
+   them apart from the error message alone is the real skill.
+   Tip: click "Build Now" on the monitor instead of waiting 2 min.
+
+
+==========================================================================
+PART 6 - RECAP + INTERVIEW QUESTIONS (10 min)
+==========================================================================
+
+Answer these out loud, using what you saw today:
+
+ 1. What is a Jenkinsfile and why keep it in the repo instead of the UI?
+ 2. Declarative pipeline: what are pipeline / agent / stages / steps / post?
+ 3. A build fails. Walk me through how you debug it.
+ 4. How do you handle secrets in Jenkins? Why single quotes in sh '...$SECRET'?
+ 5. Webhook vs Poll SCM?
+ 6. What is an executor? A build is stuck "waiting for executor" - why?
+ 7. Why is "localhost" wrong from inside a container?
+ 8. Jenkins needs Docker - how did we give it access? What's the security risk?
+ 9. How do you stop Jenkins from filling the disk?
+10. A test fails in CI but passes on your laptop. What could cause it?
+
+NEXT STEPS (after today):
+ - Add a Jenkinsfile to your Uptime Monitor project (resume bullet!)
+ - Learn: agents (run builds on a separate machine, not the controller),
+   multibranch pipelines (one job per git branch), shared libraries
+ - Push the image to Docker Hub from Jenkins with a credential
+   (withCredentials + docker login)
+
+CLEAN UP (when finished):
+   docker rm -f hello-app
+   cd ~/Desktop/jenkins-lab/jenkins-server && docker compose down
+   (add -v to also delete Jenkins data: docker compose down -v)

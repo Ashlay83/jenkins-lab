@@ -1,0 +1,198 @@
+==========================================================================
+       JENKINS LAB - HINTS & SOLUTIONS  (open only when stuck!)
+==========================================================================
+
+Each bug has: HINT 1 (nudge) -> HINT 2 (stronger) -> FIX.
+Read one level, try again for 5 min, then the next level.
+Bugs are listed in the order you'll probably hit them.
+
+
+
+
+(scroll down)
+
+
+
+
+==========================================================================
+BUG 1 - The build fails before any stage runs
+==========================================================================
+HINT 1: Read the git part of the console. What branch is it looking for?
+HINT 2: What is your repo's branch called? `git branch` on the VM.
+FIX   : Job -> Configure -> Branch Specifier: change */master to */main.
+WHERE : Job config (not code).
+LESSON: Old default branch name was "master", GitHub now uses "main".
+        Very common "couldn't find any revision to build" error.
+
+
+
+
+==========================================================================
+BUG 2 - Test stage fails
+==========================================================================
+HINT 1: Which test failed? What exception? Which file and line?
+HINT 2: Read the docstring of uptime_percent. What should happen when
+        total is 0? What does the code actually do?
+FIX   : app/calc.py
+            def uptime_percent(up, total):
+                if total == 0:
+                    return 0.0
+                return round(up / total * 100, 2)
+        Run tests on the VM first (python3 -m venv venv; . venv/bin/activate;
+        pip install -r requirements-dev.txt; python -m pytest tests) then push.
+WHERE : Code.
+LESSON: CI's job is to catch bugs BEFORE deploy. Fix code, not the test.
+
+
+
+
+==========================================================================
+BUG 3 - "No test report files were found" (shows up with bug 2)
+==========================================================================
+HINT 1: Where does pytest WRITE the report? Where does junit LOOK for it?
+HINT 2: Compare the two paths in the Jenkinsfile letter by letter.
+FIX   : post { always { junit allowEmptyResults: true, testResults: 'reports/*.xml' } }
+        ('report' -> 'reports'. allowEmptyResults stops a second confusing
+         error when the build fails before tests even ran.)
+WHERE : Jenkinsfile.
+LESSON: One build can have 2 errors. A typo in a path is a classic.
+
+
+
+
+==========================================================================
+BUG 4 - Build image: "permission denied ... docker.sock"
+==========================================================================
+HINT 1: Who runs the build (whoami in Part 2)? Who is allowed to use
+        /var/run/docker.sock? Run on the VM:  ls -l /var/run/docker.sock
+HINT 2: The socket belongs to group "docker" on the VM. The jenkins user
+        inside the container isn't in that group. Groups are matched by
+        NUMBER (GID), not by name, across host and container.
+FIX   : On the VM:   stat -c %g /var/run/docker.sock     -> e.g. 999
+        In jenkins-server/docker-compose.yml under the jenkins service add:
+            group_add:
+              - "999"          # use YOUR number
+        Then:  docker compose up -d   (recreates the container; your Jenkins
+        data survives because it lives in the jenkins_home volume)
+        Check: docker exec jenkins docker ps   -> works, no error
+WHERE : Jenkins server setup.
+LESSON: Docker socket access = root-level access to the host. Fine for a
+        lab; in companies builds run on separate agents.
+
+
+
+
+==========================================================================
+BUG 5 - Deploy: error about 'app-secret'
+==========================================================================
+HINT 1: The Jenkinsfile asks for a credential by ID. Does it exist?
+HINT 2: Manage Jenkins -> Credentials. What's in there?
+FIX   : Manage Jenkins -> Credentials -> System -> Global credentials ->
+        Add Credentials:
+            Kind   : Secret text
+            Secret : anything, e.g. s3cr3t-123
+            ID     : app-secret      (must match the Jenkinsfile EXACTLY)
+        No code change needed. Just Build Now.
+        Look at the console: the secret shows as **** (Jenkins masks it).
+WHERE : Jenkins credentials (never git).
+LESSON: Secrets live in Jenkins. The Jenkinsfile only references the ID.
+        We used single quotes sh '...' so Groovy doesn't paste the secret
+        into the command text - the shell reads it from the env var.
+
+
+
+
+==========================================================================
+BUG 6 - Smoke test: "Failed to connect to localhost port 8081"
+==========================================================================
+HINT 1: The curl runs inside the jenkins container. What is "localhost"
+        from inside a container?
+HINT 2: localhost = the jenkins container itself, not the VM, not the app.
+        Containers on the same docker network can reach each other by
+        container NAME. Is hello-app on lab-net?
+        (docker network inspect lab-net)
+FIX   : Deploy: add  --network lab-net  to docker run
+        Smoke : sh 'curl -fsS http://hello-app:5000/health'
+                (5000 = port INSIDE the container. 8081 is only the VM's
+                 port for your browser.)
+WHERE : Jenkinsfile.
+LESSON: The #1 Docker networking gotcha. Every container has its own localhost.
+
+
+
+
+==========================================================================
+BUG 7 - Deploy: 'The container name "/hello-app" is already in use'
+==========================================================================
+HINT 1: The previous build already started a container named hello-app.
+        docker ps -a
+HINT 2: A deploy must work every time, not just the first time
+        ("idempotent"). Remove the old one before starting the new one.
+FIX   : In Deploy steps, before docker run:
+            sh 'docker rm -f hello-app || true'
+        (|| true = "don't fail if there was nothing to remove")
+WHERE : Jenkinsfile.
+LESSON: This is why "run it twice" is in the done-criteria.
+
+
+
+
+==========================================================================
+BUG 8 - Smoke test fails sometimes, passes when you rebuild (flaky)
+==========================================================================
+(Might not happen to you every time - that's what flaky means.)
+HINT 1: How long does the app take to start after docker run returns?
+HINT 2: docker run -d returns instantly, Flask needs a second to boot.
+        curl hits it before it's ready (Connection refused / Could not resolve).
+FIX   : stage('Smoke test') {
+            steps {
+                retry(5) {
+                    sleep 2
+                    sh 'curl -fsS http://hello-app:5000/health'
+                }
+            }
+        }
+WHERE : Jenkinsfile.
+LESSON: Never assume a service is ready instantly. Wait + retry.
+        (Bonus: you can also see "transferring context" is big in Build
+        image - add a .dockerignore with venv/ reports/ .git/ )
+
+
+
+
+==========================================================================
+INCIDENT 1
+==========================================================================
+SYMPTOM: monitor red, curl "Could not resolve host: hello-app"
+HINT   : docker ps -a  -> look at STATUS of hello-app
+CAUSE  : container stopped ("Exited"). A stopped container drops off the
+         network, so its name doesn't resolve.
+FIX    : quick: docker start hello-app
+         proper: re-run the hello-app pipeline (deploys a fresh one)
+PREVENT: docker run --restart unless-stopped  in the Deploy stage
+         (restarts it if it crashes or the VM reboots)
+
+==========================================================================
+INCIDENT 2
+==========================================================================
+SYMPTOM: monitor red, curl "The requested URL returned error: 503"
+         (DIFFERENT from incident 1: the app is UP but unhealthy)
+HINT   : docker logs hello-app   and   curl http://<VM-IP>:8081/health
+CAUSE  : someone restarted the app by hand without APP_SECRET.
+FIX    : re-run the hello-app pipeline. Don't fix it by hand with the
+         secret in your shell history.
+PREVENT: only the pipeline deploys. "If it isn't in the pipeline, it
+         didn't happen."
+
+==========================================================================
+INCIDENT 3
+==========================================================================
+SYMPTOM: Jenkins restarted, then builds sit in the queue forever:
+         "Waiting for next available executor"
+HINT   : Manage Jenkins -> Nodes -> Built-In Node. How many executors?
+CAUSE  : number of executors set to 0 (a startup script changed it).
+FIX    : Built-In Node -> Configure -> Number of executors: 2 -> Save.
+         Queued builds start immediately.
+PREVENT: Configure Jenkins as code (JCasC plugin) so config is in git and
+         changes are reviewed. Also watch `docker logs jenkins` after
+         restarts.
