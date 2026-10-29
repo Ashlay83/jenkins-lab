@@ -49,7 +49,7 @@ pipeline {
 
         stage('Smoke test') {
             steps {
-                sh 'curl -fsS http://localhost:5000/health'
+                sh 'curl -fsS http://hello-app:5000/health'
             }
         }
     }
