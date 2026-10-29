@@ -43,7 +43,7 @@ pipeline {
                 APP_SECRET = credentials('app-secret')
             }
             steps {
-                sh 'docker run -d --name hello-app -p 8081:5000 -e APP_SECRET -e APP_VERSION=$BUILD_NUMBER $IMAGE:$BUILD_NUMBER'
+                sh 'docker run -d --name hello-app -p 8081:5000 --network lab-net -e APP_SECRET -e APP_VERSION=$BUILD_NUMBER $IMAGE:$BUILD_NUMBER'
             }
         }
 
